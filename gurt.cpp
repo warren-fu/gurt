@@ -11,13 +11,14 @@
 #include <cmath>
 
 // Platform-specific includes
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #include <iphlpapi.h>
     #include <icmpapi.h>
+    #include <climits> // For LONG_MAX and LONG_MIN
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "iphlpapi.lib")
     
@@ -56,7 +57,7 @@
 using namespace std;
 using namespace std::chrono;
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
 // Simple getopt implementation for Windows
 int getopt(int argc, char* const argv[], const char* optstring) {
     static int sp = 1;
@@ -293,7 +294,7 @@ void help() {
 PingSettings parseArguments(int argc, char* argv[]) {
     PingSettings settings;
     
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
     // Simple argument parsing for Windows (no getopt_long)
     for (int i = 1; i < argc; i++) {
         string arg = argv[i];
@@ -383,7 +384,7 @@ PingSettings parseArguments(int argc, char* argv[]) {
 int ping(const string& ip_address, int sequence = 1) {
     auto start = high_resolution_clock::now();
     
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
     // Windows ICMP implementation using Windows API
     HANDLE hIcmpFile = IcmpCreateFile();
     if (hIcmpFile == INVALID_HANDLE_VALUE) {
@@ -548,7 +549,7 @@ void pingWorker(const string& ip_address, int interval, PingStats* stats) {
             } else {
                 string error_msg;
                 switch (latency) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
                     case -1: error_msg = "ICMP handle creation failed"; break;
                     case -2: error_msg = "invalid IP address"; break;
                     case -3: error_msg = "memory allocation failed"; break;
@@ -574,6 +575,13 @@ void pingWorker(const string& ip_address, int interval, PingStats* stats) {
 }
 
 int main(int argc, char* argv[]) {
+    // Debug: Show what platform was detected
+#if defined(_WIN32) || defined(_WIN64) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
+    cout << "DEBUG: Windows platform detected - using Windows ICMP API" << endl;
+#else
+    cout << "DEBUG: Unix platform detected - using raw sockets" << endl;
+#endif
+
     // Initialize network (required on Windows)
     if (!initializeNetwork()) {
         cerr << "Failed to initialize network" << endl;
