@@ -3,22 +3,124 @@
 #include <string>
 #include <vector>
 #include <cstring>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/ip_icmp.h>
-#include <netinet/ip.h>
-#include <unistd.h>
 #include <thread>
 #include <chrono>
 #include <mutex>
-#include <getopt.h>
-#include <signal.h>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
 
+// Platform-specific includes
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <iphlpapi.h>
+    #include <icmpapi.h>
+    #pragma comment(lib, "ws2_32.lib")
+    #pragma comment(lib, "iphlpapi.lib")
+    
+    // Windows doesn't have getopt, so we'll implement a simple version
+    char* optarg = nullptr;
+    int optind = 1;
+    int getopt(int argc, char* const argv[], const char* optstring);
+    
+    // Windows signal handling
+    #include <csignal>
+    typedef void (*sighandler_t)(int);
+    #define SIGTSTP SIGTERM  // Windows doesn't have SIGTSTP
+    
+    // Windows-specific definitions
+    #define close closesocket
+    typedef int socklen_t;
+    
+#else
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <netinet/ip_icmp.h>
+    #include <netinet/ip.h>
+    #include <unistd.h>
+    #include <getopt.h>
+    #include <signal.h>
+    
+    // Unix-specific ICMP structure (Windows has different API)
+    #ifndef ICMP_ECHO
+    #define ICMP_ECHO 8
+    #endif
+    #ifndef ICMP_ECHOREPLY  
+    #define ICMP_ECHOREPLY 0
+    #endif
+#endif
+
 using namespace std;
 using namespace std::chrono;
+
+#ifdef _WIN32
+// Simple getopt implementation for Windows
+int getopt(int argc, char* const argv[], const char* optstring) {
+    static int sp = 1;
+    int c;
+    char* cp;
+
+    if (sp == 1) {
+        if (optind >= argc || argv[optind][0] != '-' || argv[optind][1] == '\0')
+            return -1;
+        else if (strcmp(argv[optind], "--") == 0) {
+            optind++;
+            return -1;
+        }
+    }
+    
+    c = argv[optind][sp];
+    if (c == ':' || (cp = const_cast<char*>(strchr(optstring, c))) == nullptr) {
+        if (argv[optind][++sp] == '\0') {
+            optind++;
+            sp = 1;
+        }
+        return '?';
+    }
+    
+    if (*++cp == ':') {
+        if (argv[optind][sp+1] != '\0')
+            optarg = &argv[optind++][sp+1];
+        else if (++optind >= argc) {
+            sp = 1;
+            return '?';
+        } else
+            optarg = argv[optind++];
+        sp = 1;
+    } else {
+        if (argv[optind][++sp] == '\0') {
+            sp = 1;
+            optind++;
+        }
+        optarg = nullptr;
+    }
+    
+    return c;
+}
+
+// Windows network initialization
+bool initializeNetwork() {
+    WSADATA wsaData;
+    return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+}
+
+void cleanupNetwork() {
+    WSACleanup();
+}
+
+#else
+// Unix network functions (no special initialization needed)
+bool initializeNetwork() {
+    return true;
+}
+
+void cleanupNetwork() {
+    // Nothing to do on Unix
+}
+#endif
 
 struct PingSettings {
     bool help = false;
@@ -191,6 +293,50 @@ void help() {
 PingSettings parseArguments(int argc, char* argv[]) {
     PingSettings settings;
     
+#ifdef _WIN32
+    // Simple argument parsing for Windows (no getopt_long)
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            settings.help = true;
+        } else if (arg == "-i" || arg == "--interval") {
+            if (i + 1 < argc) {
+                try {
+                    settings.interval = stoi(argv[++i]);
+                    if (settings.interval <= 0) {
+                        cerr << "error: interval must be greater than 0" << endl;
+                        exit(1);
+                    }
+                } catch (const exception& e) {
+                    cerr << "error: invalid interval value" << endl;
+                    exit(1);
+                }
+            } else {
+                cerr << "error: interval option requires a value" << endl;
+                exit(1);
+            }
+        } else if (arg.substr(0, 2) == "-i") {
+            // Handle -i<value> format
+            try {
+                settings.interval = stoi(arg.substr(2));
+                if (settings.interval <= 0) {
+                    cerr << "error: interval must be greater than 0" << endl;
+                    exit(1);
+                }
+            } catch (const exception& e) {
+                cerr << "error: invalid interval value" << endl;
+                exit(1);
+            }
+        } else if (arg[0] == '-') {
+            cerr << "unknown option: " << arg << ". use -h for help." << endl;
+            exit(1);
+        } else {
+            // This is an IP address
+            settings.ip_addresses.push_back(arg);
+        }
+    }
+#else
+    // Unix systems with getopt_long
     static struct option long_options[] = {
         {"help", no_argument, 0, 'h'},
         {"interval", required_argument, 0, 'i'},
@@ -229,6 +375,7 @@ PingSettings parseArguments(int argc, char* argv[]) {
     for (int i = optind; i < argc; i++) {
         settings.ip_addresses.push_back(argv[i]);
     }
+#endif
     
     return settings;
 }
@@ -236,7 +383,54 @@ PingSettings parseArguments(int argc, char* argv[]) {
 int ping(const string& ip_address, int sequence = 1) {
     auto start = high_resolution_clock::now();
     
-    // Create raw socket for ICMP (requires root privileges)
+#ifdef _WIN32
+    // Windows ICMP implementation using Windows API
+    HANDLE hIcmpFile = IcmpCreateFile();
+    if (hIcmpFile == INVALID_HANDLE_VALUE) {
+        return -1; // Error creating ICMP handle
+    }
+    
+    // Convert IP address
+    ULONG dest_ip = inet_addr(ip_address.c_str());
+    if (dest_ip == INADDR_NONE) {
+        IcmpCloseHandle(hIcmpFile);
+        return -2; // Invalid IP address
+    }
+    
+    // Prepare data to send
+    char send_data[32];
+    memset(send_data, 0xAA, sizeof(send_data));
+    
+    // Reply buffer
+    DWORD reply_size = sizeof(ICMP_ECHO_REPLY) + sizeof(send_data);
+    void* reply_buffer = malloc(reply_size);
+    if (!reply_buffer) {
+        IcmpCloseHandle(hIcmpFile);
+        return -3; // Memory allocation failed
+    }
+    
+    // Send ping
+    DWORD result = IcmpSendEcho(hIcmpFile, dest_ip, send_data, sizeof(send_data),
+                                nullptr, reply_buffer, reply_size, 5000); // 5 second timeout
+    
+    auto end = high_resolution_clock::now();
+    
+    if (result != 0) {
+        PICMP_ECHO_REPLY echo_reply = (PICMP_ECHO_REPLY)reply_buffer;
+        if (echo_reply->Status == IP_SUCCESS) {
+            DWORD latency_ms = echo_reply->RoundTripTime;
+            free(reply_buffer);
+            IcmpCloseHandle(hIcmpFile);
+            return latency_ms * 1000; // Convert to microseconds
+        }
+    }
+    
+    free(reply_buffer);
+    IcmpCloseHandle(hIcmpFile);
+    return -4; // Ping failed
+    
+#else
+    // Unix ICMP implementation (original code)
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (sock < 0) {
         return -1; // Error creating socket (likely need root privileges)
@@ -314,6 +508,7 @@ int ping(const string& ip_address, int sequence = 1) {
     }
     
     return -6; // Not our packet
+#endif
 }
 
 void pingWorker(const string& ip_address, int interval, PingStats* stats) {
@@ -353,12 +548,19 @@ void pingWorker(const string& ip_address, int interval, PingStats* stats) {
             } else {
                 string error_msg;
                 switch (latency) {
+#ifdef _WIN32
+                    case -1: error_msg = "ICMP handle creation failed"; break;
+                    case -2: error_msg = "invalid IP address"; break;
+                    case -3: error_msg = "memory allocation failed"; break;
+                    case -4: error_msg = "ping failed or timeout"; break;
+#else
                     case -1: error_msg = "socket creation failed (run 'sudo make install' to set up permissions)"; break;
                     case -2: error_msg = "invalid IP address"; break;
                     case -3: error_msg = "send failed"; break;
                     case -4: error_msg = "receive timeout or error"; break;
                     case -5: error_msg = "packet too short"; break;
                     case -6: error_msg = "not our packet"; break;
+#endif
                     default: error_msg = "unknown error"; break;
                 }
                 string color = getColorForIP(ip_address, stats->instance_id);
@@ -372,9 +574,15 @@ void pingWorker(const string& ip_address, int interval, PingStats* stats) {
 }
 
 int main(int argc, char* argv[]) {
+    // Initialize network (required on Windows)
+    if (!initializeNetwork()) {
+        cerr << "Failed to initialize network" << endl;
+        return 1;
+    }
+    
     // Set up signal handlers
     signal(SIGINT, signalHandler);  // Ctrl+C
-    signal(SIGTSTP, signalHandler); // Ctrl+Z
+    signal(SIGTSTP, signalHandler); // Ctrl+Z (or SIGTERM on Windows)
     
     // Parse command line arguments
     PingSettings settings = parseArguments(argc, argv);
@@ -382,6 +590,7 @@ int main(int argc, char* argv[]) {
     // Show help if requested or if no arguments provided
     if (settings.help || argc == 1) {
         help();
+        cleanupNetwork();
         return 0;
     }
     
@@ -389,6 +598,7 @@ int main(int argc, char* argv[]) {
     if (settings.ip_addresses.empty()) {
         cerr << "error: at least one IP address is required" << endl;
         cerr << "use -h or --help for help" << endl;
+        cleanupNetwork();
         return 1;
     }
     
@@ -424,5 +634,6 @@ int main(int argc, char* argv[]) {
         delete stats;
     }
     
+    cleanupNetwork();
     return 0;
 }
