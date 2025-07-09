@@ -17,7 +17,7 @@ a modern, colorful, and feature-rich ping utility written in c++ that can simult
 ### prerequisites
 
 - c++ compiler with c++11 support (g++, clang++)
-- linux or macOS system
+- only tested on mac but should work for linux
 - root privileges (required for raw ICMP sockets)
 
 ### build & install
